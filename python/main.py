@@ -6,82 +6,114 @@ Autores: Stalin Franco, Luis Salazar
 Docente: Eladio Lobo
 
 Este script captura video en tiempo real, detecta los 21 landmarks de la mano
-usando MediaPipe, calcula parámetros de control (ángulo de inclinación,
+usando MediaPipe (API tasks), calcula parámetros de control (ángulo de inclinación,
 distancia pulgar-meñique, posición 2D de la muñeca) y los envía vía serial
 a un Arduino para controlar 4 servomotores.
+
+Funciona incluso si el Arduino no está conectado (modo simulación).
 """
 
 import cv2
 import math
 import serial
 import time
-import mediapipe as mp
+import os
+import sys
+import numpy as np
+import urllib.request
 
 # ============================================================================
-# CONFIGURACIÓN DE COMUNICACIÓN SERIAL
+# IMPORTACIÓN DE MEDIAPIPE (Nueva API tasks)
 # ============================================================================
-# IMPORTANTE: Cambia 'COM7' por el puerto donde esté conectado tu Arduino.
-# Puedes identificarlo desde el Arduino IDE (Herramientas > Puerto).
+from mediapipe.tasks.python.vision import (
+    HandLandmarker,
+    HandLandmarkerOptions,
+    HandLandmarkerResult,
+    RunningMode,
+    drawing_utils,
+    HandLandmarksConnections
+)
+from mediapipe.tasks.python.core.base_options import BaseOptions
+from mediapipe.tasks.python.vision.core.image import Image
+from mediapipe import ImageFormat
+
+# ============================================================================
+# CONFIGURACIÓN
+# ============================================================================
+
+# --- Configuración Serial (Arduino) ---
+# Cambia 'COM7' por el puerto donde esté conectado tu Arduino.
+# Si no hay Arduino conectado, el sistema funciona igual en modo simulación.
 PUERTO_SERIAL = 'COM7'
 BAUD_RATE = 9600
 TIMEOUT = 1
 
-# ============================================================================
-# INICIALIZACIÓN DE COMPONENTES
-# ============================================================================
+# --- Configuración del modelo MediaPipe ---
+# El modelo se descarga automáticamente la primera vez
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 
-# Inicializar MediaPipe Hands
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-
-# Inicializar captura de video (0 = cámara integrada, 1 = USB, etc.)
-cap = cv2.VideoCapture(0)
-
-# Verificar que la cámara se abrió correctamente
-if not cap.isOpened():
-    print("ERROR: No se pudo abrir la cámara.")
-    print("Verifica que la cámara esté conectada y no esté siendo usada por otra aplicación.")
-    exit(1)
-
-# Configurar resolución de la cámara (opcional)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-# Inicializar comunicación serial con Arduino
-try:
-    arduino = serial.Serial(PUERTO_SERIAL, BAUD_RATE, timeout=TIMEOUT)
-    time.sleep(2)  # Esperar a que se establezca la conexión serial
-    print(f"Conectado a Arduino en {PUERTO_SERIAL} a {BAUD_RATE} baudios.")
-except serial.SerialException as e:
-    print(f"ERROR: No se pudo conectar al puerto serial {PUERTO_SERIAL}.")
-    print(f"Detalles: {e}")
-    print("Verifica que:")
-    print("  1. El Arduino esté conectado por USB.")
-    print("  2. El puerto COM sea el correcto (revisa en Arduino IDE).")
-    print("  3. No haya otra aplicación usando el puerto (cierra Arduino IDE si está abierto).")
-    cap.release()
-    exit(1)
+# --- Configuración de cámara ---
+CAMARA_INDEX = 0  # 0 = integrada, 1 = USB, etc.
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
 
 # ============================================================================
-# VARIABLES DE CONTROL
+# FUNCIÓN: DESCARGA DEL MODELO
 # ============================================================================
 
-# Para mantener el último valor válido en caso de pérdida de detección
-ultimo_angulo = 90.0
-ultima_distancia = 90.0
-ultimo_mov_x = 90.0
-ultimo_mov_y = 90.0
+def descargar_modelo():
+    """
+    Descarga el modelo hand_landmarker.task si no existe localmente.
+    """
+    if os.path.exists(MODEL_PATH):
+        print(f"Modelo encontrado: {MODEL_PATH}")
+        return True
+
+    print("=" * 60)
+    print("DESCARGANDO MODELO DE MEDIAPIPE HANDS...")
+    print("=" * 60)
+    print(f"Origen: {MODEL_URL}")
+    print(f"Destino: {MODEL_PATH}")
+    print("Esto puede tomar unos segundos...")
+
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("✅ Modelo descargado exitosamente.")
+        return True
+    except Exception as e:
+        print(f"❌ Error al descargar el modelo: {e}")
+        print("\nPuedes descargarlo manualmente desde:")
+        print(MODEL_URL)
+        print(f"Y guardarlo en: {MODEL_PATH}")
+        return False
 
 # ============================================================================
-# FUNCIONES AUXILIARES
+# FUNCIÓN: INICIALIZAR ARDUINO (OPCIONAL)
+# ============================================================================
+
+def inicializar_arduino(puerto, baudios, timeout):
+    """
+    Intenta conectar con el Arduino. Si no está disponible, el sistema
+    funciona en modo simulación (sin Arduino).
+
+    Returns:
+        tuple: (arduino_objeto or None, modo_simulacion bool)
+    """
+    try:
+        arduino = serial.Serial(puerto, baudios, timeout=timeout)
+        time.sleep(2)  # Esperar a que se establezca la conexión serial
+        print(f"✅ Conectado a Arduino en {puerto} a {baudios} baudios.")
+        return arduino, False
+    except serial.SerialException as e:
+        print(f"⚠️  No se pudo conectar al Arduino en {puerto}.")
+        print(f"   Razón: {e}")
+        print("   El sistema funcionará en MODO SIMULACIÓN (sin Arduino).")
+        print("   Los valores se mostrarán solo en pantalla.")
+        return None, True
+
+# ============================================================================
+# FUNCIONES DE CÁLCULO DE PARÁMETROS
 # ============================================================================
 
 def calcular_angulo_inclinacion(wrist, middle_tip):
@@ -92,26 +124,20 @@ def calcular_angulo_inclinacion(wrist, middle_tip):
     Fórmula: ángulo = atan2(dy, dx) convertido a grados y normalizado a 0-180.
 
     Args:
-        wrist: Landmark de la muñeca (HandLandmark.WRIST)
-        middle_tip: Landmark de la punta del dedo medio (HandLandmark.MIDDLE_FINGER_TIP)
+        wrist: NormalizedLandmark de la muñeca (índice 0)
+        middle_tip: NormalizedLandmark de la punta del dedo medio (índice 12)
 
     Returns:
         float: Ángulo de inclinación normalizado entre 0 y 180 grados.
     """
-    # Calcular diferencias entre los puntos
     reference_dx = middle_tip.x - wrist.x
     reference_dy = middle_tip.y - wrist.y
 
-    # Calcular ángulo en radianes usando arco tangente
     angle_rad = math.atan2(reference_dy, reference_dx)
-
-    # Convertir a grados y normalizar a 0-360
     angle_deg = math.degrees(angle_rad) % 360
 
     # Mapear a 0-180 grados
-    if angle_deg <= 180:
-        angle_deg = angle_deg
-    else:
+    if angle_deg > 180:
         angle_deg = 360 - angle_deg
 
     return angle_deg
@@ -126,21 +152,18 @@ def calcular_distancia_pulgar_menique(thumb_tip, pinky_tip):
     Fórmula: distancia = 2 * sqrt((x1-x2)² + (y1-y2)²)
 
     Args:
-        thumb_tip: Landmark de la punta del pulgar (HandLandmark.THUMB_TIP)
-        pinky_tip: Landmark de la punta del meñique (HandLandmark.PINKY_TIP)
+        thumb_tip: NormalizedLandmark de la punta del pulgar (índice 4)
+        pinky_tip: NormalizedLandmark de la punta del meñique (índice 20)
 
     Returns:
         float: Distancia normalizada entre 0 y 180.
     """
-    # Distancia euclidiana multiplicada por 2 para mejor escalado
     distance = 2 * math.sqrt(
         (thumb_tip.x - pinky_tip.x) ** 2 +
         (thumb_tip.y - pinky_tip.y) ** 2
     )
 
-    # Escalar a 0-180 y limitar
     distance_px = min(180, int(distance * 180))
-
     return distance_px
 
 
@@ -149,7 +172,7 @@ def calcular_posicion_muneca(wrist):
     Calcula la posición 2D de la muñeca escalada a 0-180 grados.
 
     Args:
-        wrist: Landmark de la muñeca (HandLandmark.WRIST)
+        wrist: NormalizedLandmark de la muñeca (índice 0)
 
     Returns:
         tuple: (posicion_x, posicion_y) valores entre 0 y 180.
@@ -157,156 +180,292 @@ def calcular_posicion_muneca(wrist):
     movimiento_x = wrist.x * 180
     movimiento_y = wrist.y * 180
 
-    # Limitar a 0-180 por seguridad
     movimiento_x = max(0, min(180, movimiento_x))
     movimiento_y = max(0, min(180, movimiento_y))
 
     return movimiento_x, movimiento_y
 
 
-# ============================================================================
-# BUCLE PRINCIPAL
-# ============================================================================
+def enviar_a_arduino(arduino, modo_simulacion, angulo, distancia, mov_x, mov_y):
+    """
+    Envía los datos al Arduino por puerto serial.
+    Si está en modo simulación, solo muestra los datos en consola.
 
-print("\n" + "=" * 60)
-print("SISTEMA DE CONTROL GESTUAL INICIADO")
-print("=" * 60)
-print("Presiona 'q' o 'ESC' para salir.")
-print("Muestra tu mano frente a la cámara para controlar los servos.")
-print("=" * 60 + "\n")
+    Formato: "ángulo,distancia_pulgar_menique,posicion_x,posicion_y\n"
+    """
+    data = f"{angulo:.1f},{distancia:.1f},{mov_x:.1f},{mov_y:.1f}\n"
 
-while cap.isOpened():
-    # Leer un frame de la cámara
-    ret, frame = cap.read()
-
-    if not ret:
-        print("ERROR: No se pudo leer el frame de la cámara.")
-        break
-
-    # Voltear el frame horizontalmente para efecto espejo
-    frame = cv2.flip(frame, 1)
-
-    # Convertir BGR a RGB (MediaPipe requiere RGB)
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # Procesar el frame con MediaPipe Hands
-    results = hands.process(frame_rgb)
-
-    # Variables para los datos a enviar
-    mano_detectada = False
-
-    # Verificar si se detectaron landmarks de la mano
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            # Dibujar los landmarks y conexiones en el frame
-            mp_drawing.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp_hands.HAND_CONNECTIONS,
-                mp_drawing_styles.get_default_hand_landmarks_style(),
-                mp_drawing_styles.get_default_hand_connections_style()
-            )
-
-            # Obtener los landmarks específicos que necesitamos
-            landmarks = hand_landmarks.landmark
-
-            wrist = landmarks[mp_hands.HandLandmark.WRIST]
-            middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-            middle_mcp = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_MCP]
-            thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
-            pinky_tip = landmarks[mp_hands.HandLandmark.PINKY_TIP]
-
-            # --- CÁLCULO DE PARÁMETROS DE CONTROL ---
-
-            # 1. Ángulo de inclinación de la palma
-            angle_deg = calcular_angulo_inclinacion(wrist, middle_tip)
-
-            # 2. Distancia entre pulgar y meñique (control de la pinza/garra)
-            distance_px = calcular_distancia_pulgar_menique(thumb_tip, pinky_tip)
-
-            # 3. Posición 2D de la muñeca (control de base y altura)
-            movimiento_x, movimiento_y = calcular_posicion_muneca(wrist)
-
-            # Actualizar últimos valores válidos
-            ultimo_angulo = angle_deg
-            ultima_distancia = distance_px
-            ultimo_mov_x = movimiento_x
-            ultimo_mov_y = movimiento_y
-
-            mano_detectada = True
-
-            # --- MOSTRAR INFORMACIÓN EN PANTALLA ---
-
-            # Mostrar los valores calculados en el frame
-            info_text = [
-                f"Angulo: {angle_deg:.1f}°",
-                f"Pinza (dist): {distance_px:.1f}",
-                f"Base (X): {movimiento_x:.1f}",
-                f"Altura (Y): {movimiento_y:.1f}"
-            ]
-
-            for i, text in enumerate(info_text):
-                cv2.putText(
-                    frame, text, (10, 30 + i * 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
-                )
-
-            # --- ENVÍO DE DATOS POR SERIAL AL ARDUINO ---
-
-            # Formato: "ángulo,distancia_pulgar_menique,posicion_x,posicion_y\n"
-            data = f"{angle_deg:.1f},{distance_px:.1f},{movimiento_x:.1f},{movimiento_y:.1f}\n"
-
-            try:
-                arduino.write(data.encode())
-            except serial.SerialException as e:
-                print(f"ERROR de comunicación serial: {e}")
-                break
-
+    if modo_simulacion:
+        # En modo simulación, mostrar cada 30 frames para no saturar la consola
+        if not hasattr(enviar_a_arduino, "frame_count"):
+            enviar_a_arduino.frame_count = 0
+        enviar_a_arduino.frame_count += 1
+        if enviar_a_arduino.frame_count % 30 == 0:
+            print(f"[SIMULACIÓN] Datos enviados: {data.strip()}")
     else:
-        # Si no se detecta mano, mantener los últimos valores válidos
-        # Esto evita que los servos se muevan a posiciones erráticas
+        try:
+            arduino.write(data.encode())
+        except serial.SerialException as e:
+            print(f"❌ Error de comunicación serial: {e}")
+            return False
+
+    return True
+
+
+# ============================================================================
+# FUNCIÓN: DIBUJAR INFORMACIÓN EN EL FRAME
+# ============================================================================
+
+def dibujar_info_en_frame(frame, angulo, distancia, mov_x, mov_y,
+                          mano_detectada, fps=None):
+    """
+    Dibuja la información de control y los valores calculados en el frame.
+    """
+    alto, ancho = frame.shape[:2]
+
+    # Fondo semitransparente para la información
+    overlay = frame.copy()
+
+    if mano_detectada:
+        # Mostrar valores de control
+        info_text = [
+            f"Angulo (Base): {angulo:.1f}°",
+            f"Pinza (dist): {distancia:.1f}",
+            f"Base (X): {mov_x:.1f}",
+            f"Altura (Y): {mov_y:.1f}"
+        ]
+
+        # Rectángulo de fondo
+        cv2.rectangle(overlay, (5, 5), (250, 120), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+        for i, text in enumerate(info_text):
+            cv2.putText(
+                frame, text, (10, 30 + i * 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
+            )
+    else:
+        cv2.rectangle(overlay, (5, 5), (300, 40), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
         cv2.putText(
             frame, "MANO NO DETECTADA",
             (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
             0.7, (0, 0, 255), 2
         )
 
-        # Enviar los últimos valores válidos para mantener posición
-        data = f"{ultimo_angulo:.1f},{ultima_distancia:.1f},{ultimo_mov_x:.1f},{ultimo_mov_y:.1f}\n"
-        try:
-            arduino.write(data.encode())
-        except serial.SerialException as e:
-            print(f"ERROR de comunicación serial: {e}")
-            break
+    # Mostrar FPS si está disponible
+    if fps is not None:
+        cv2.putText(
+            frame, f"FPS: {fps:.1f}",
+            (ancho - 120, 30), cv2.FONT_HERSHEY_SIMPLEX,
+            0.5, (255, 255, 0), 1
+        )
 
-    # --- MOSTRAR EL FRAME CON LA INFORMACIÓN ---
-
-    # Agregar instrucciones en pantalla
+    # Instrucciones
     cv2.putText(
-        frame, "Presiona 'q' para salir",
-        (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX,
-        0.5, (255, 255, 255), 1
+        frame, "Presiona 'q' o 'ESC' para salir",
+        (10, alto - 10), cv2.FONT_HERSHEY_SIMPLEX,
+        0.5, (200, 200, 200), 1
     )
 
-    # Mostrar el frame
-    cv2.imshow('Control Gestual de Brazo Robotico', frame)
-
-    # Salir con 'q' o ESC
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q') or key == 27:  # 27 = ESC
-        break
 
 # ============================================================================
-# LIMPIEZA Y CIERRE
+# FUNCIÓN PRINCIPAL
 # ============================================================================
 
-print("\nCerrando sistema de control gestual...")
+def main():
+    print("\n" + "=" * 60)
+    print("🤖 CONTROL GESTUAL DE BRAZO ROBÓTICO")
+    print("=" * 60)
+    print("Visión por Computadora + Arduino")
+    print("Autores: Stalin Franco, Luis Salazar")
+    print("=" * 60 + "\n")
 
-# Liberar recursos
-cap.release()
-cv2.destroyAllWindows()
-hands.close()
-arduino.close()
+    # --- PASO 1: Descargar modelo si es necesario ---
+    if not descargar_modelo():
+        print("❌ No se pudo obtener el modelo. Saliendo...")
+        sys.exit(1)
 
-print("Sistema cerrado correctamente.")
-print("Gracias por usar el Control Gestual de Brazo Robotico.")
+    # --- PASO 2: Inicializar MediaPipe HandLandmarker ---
+    print("\nInicializando MediaPipe HandLandmarker...")
+    try:
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=MODEL_PATH),
+            running_mode=RunningMode.LIVE_STREAM,
+            num_hands=1,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            result_callback=None  # Usaremos detect_async con callback
+        )
+        landmarker = HandLandmarker.create_from_options(options)
+        print("✅ MediaPipe HandLandmarker inicializado.")
+    except Exception as e:
+        print(f"❌ Error al inicializar MediaPipe: {e}")
+        sys.exit(1)
+
+    # --- PASO 3: Inicializar cámara ---
+    print(f"\nInicializando cámara (índice {CAMARA_INDEX})...")
+    cap = cv2.VideoCapture(CAMARA_INDEX)
+
+    if not cap.isOpened():
+        print(f"❌ Error: No se pudo abrir la cámara {CAMARA_INDEX}.")
+        print("   Verifica que la cámara esté conectada.")
+        print("   Prueba cambiando CAMARA_INDEX a 1 si usas cámara USB.")
+        landmarker.close()
+        sys.exit(1)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    print("✅ Cámara inicializada.")
+
+    # --- PASO 4: Inicializar Arduino (opcional) ---
+    print(f"\nConectando con Arduino en {PUERTO_SERIAL}...")
+    arduino, modo_simulacion = inicializar_arduino(PUERTO_SERIAL, BAUD_RATE, TIMEOUT)
+
+    # --- PASO 5: Variables de control ---
+    ultimo_angulo = 90.0
+    ultima_distancia = 90.0
+    ultimo_mov_x = 90.0
+    ultimo_mov_y = 90.0
+
+    # Variables para el resultado asíncrono de MediaPipe
+    resultado_mano = [None]  # Usamos lista para mutabilidad en callback
+    timestamp = [0]
+
+    # Variables para FPS
+    frame_count = 0
+    fps_start_time = time.time()
+    fps_actual = 0.0
+
+    # --- PASO 6: BUCLE PRINCIPAL ---
+    print("\n" + "=" * 60)
+    print("🎯 SISTEMA INICIADO")
+    if modo_simulacion:
+        print("   MODO: SIMULACIÓN (sin Arduino)")
+    else:
+        print("   MODO: CONTROL REAL (con Arduino)")
+    print("=" * 60)
+    print("Presiona 'q' o 'ESC' para salir.")
+    print("Muestra tu mano frente a la cámara para controlar los servos.")
+    print("=" * 60 + "\n")
+
+    while cap.isOpened():
+        # Leer frame de la cámara
+        ret, frame = cap.read()
+        if not ret:
+            print("❌ Error al leer frame de la cámara.")
+            break
+
+        # Voltear horizontalmente para efecto espejo
+        frame = cv2.flip(frame, 1)
+
+        # Convertir BGR a RGB (OpenCV usa BGR, MediaPipe usa RGB)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Crear imagen de MediaPipe y procesar
+        mp_image = Image(image_format=ImageFormat.SRGB, data=frame_rgb)
+
+        # Variable para almacenar el resultado de este frame
+        resultado_actual = [None]
+
+        def callback(result: HandLandmarkerResult, image: Image, ts: int):
+            resultado_actual[0] = result
+
+        # Enviar a detect_async con callback local
+        landmarker.detect_async(mp_image, timestamp[0])
+        timestamp[0] += 1
+
+        # Pequeña pausa para permitir que el callback se ejecute
+        time.sleep(0.001)
+
+        # Variables para este frame
+        mano_detectada = False
+        angulo = ultimo_angulo
+        distancia = ultima_distancia
+        mov_x = ultimo_mov_x
+        mov_y = ultimo_mov_y
+
+        # Procesar resultado si existe
+        if resultado_actual[0] is not None:
+            result = resultado_actual[0]
+
+            if result.hand_landmarks and len(result.hand_landmarks) > 0:
+                hand_landmarks = result.hand_landmarks[0]  # Primera mano
+
+                # Verificar que tenemos suficientes landmarks (21)
+                if len(hand_landmarks) >= 21:
+                    # Obtener landmarks específicos por índice
+                    wrist = hand_landmarks[0]       # WRIST
+                    thumb_tip = hand_landmarks[4]    # THUMB_TIP
+                    middle_tip = hand_landmarks[12]  # MIDDLE_FINGER_TIP
+                    pinky_tip = hand_landmarks[20]   # PINKY_TIP
+
+                    # --- CALCULAR PARÁMETROS ---
+                    angulo = calcular_angulo_inclinacion(wrist, middle_tip)
+                    distancia = calcular_distancia_pulgar_menique(thumb_tip, pinky_tip)
+                    mov_x, mov_y = calcular_posicion_muneca(wrist)
+
+                    # Actualizar últimos valores válidos
+                    ultimo_angulo = angulo
+                    ultima_distancia = distancia
+                    ultimo_mov_x = mov_x
+                    ultimo_mov_y = mov_y
+
+                    mano_detectada = True
+
+                    # --- DIBUJAR LANDMARKS EN EL FRAME ---
+                    # Convertir NormalizedLandmarks a lista de tuplas para drawing_utils
+                    drawing_utils.draw_landmarks(
+                        frame,
+                        hand_landmarks,
+                        HandLandmarksConnections.HAND_CONNECTIONS
+                    )
+
+        # --- ENVIAR DATOS AL ARDUINO ---
+        enviar_a_arduino(arduino, modo_simulacion, angulo, distancia, mov_x, mov_y)
+
+        # --- CALCULAR FPS ---
+        frame_count += 1
+        if frame_count >= 30:
+            elapsed = time.time() - fps_start_time
+            fps_actual = frame_count / elapsed
+            frame_count = 0
+            fps_start_time = time.time()
+
+        # --- DIBUJAR INFORMACIÓN EN PANTALLA ---
+        dibujar_info_en_frame(frame, angulo, distancia, mov_x, mov_y,
+                              mano_detectada, fps_actual)
+
+        # --- MOSTRAR FRAME ---
+        cv2.imshow('Control Gestual de Brazo Robotico', frame)
+
+        # --- SALIR CON 'q' O ESC ---
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == 27:
+            break
+
+    # ========================================================================
+    # LIMPIEZA Y CIERRE
+    # ========================================================================
+    print("\n" + "=" * 60)
+    print("Cerrando sistema de control gestual...")
+    print("=" * 60)
+
+    cap.release()
+    cv2.destroyAllWindows()
+    landmarker.close()
+
+    if arduino is not None:
+        arduino.close()
+
+    print("✅ Sistema cerrado correctamente.")
+    print("Gracias por usar el Control Gestual de Brazo Robotico.")
+
+
+# ============================================================================
+# PUNTO DE ENTRADA
+# ============================================================================
+
+if __name__ == "__main__":
+    main()
