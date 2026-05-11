@@ -44,7 +44,7 @@ from mediapipe import ImageFormat
 # --- Configuración Serial (Arduino) ---
 # Cambia 'COM7' por el puerto donde esté conectado tu Arduino.
 # Si no hay Arduino conectado, el sistema funciona igual en modo simulación.
-PUERTO_SERIAL = 'COM7'
+PUERTO_SERIAL = 'COM4'
 BAUD_RATE = 9600
 TIMEOUT = 1
 
@@ -291,18 +291,18 @@ def main():
     try:
         options = HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=MODEL_PATH),
-            running_mode=RunningMode.LIVE_STREAM,
+            running_mode=RunningMode.IMAGE,
             num_hands=1,
             min_hand_detection_confidence=0.5,
             min_hand_presence_confidence=0.5,
             min_tracking_confidence=0.5,
-            result_callback=None  # Usaremos detect_async con callback
         )
         landmarker = HandLandmarker.create_from_options(options)
         print("✅ MediaPipe HandLandmarker inicializado.")
     except Exception as e:
         print(f"❌ Error al inicializar MediaPipe: {e}")
         sys.exit(1)
+
 
     # --- PASO 3: Inicializar cámara ---
     print(f"\nInicializando cámara (índice {CAMARA_INDEX})...")
@@ -328,10 +328,6 @@ def main():
     ultima_distancia = 90.0
     ultimo_mov_x = 90.0
     ultimo_mov_y = 90.0
-
-    # Variables para el resultado asíncrono de MediaPipe
-    resultado_mano = [None]  # Usamos lista para mutabilidad en callback
-    timestamp = [0]
 
     # Variables para FPS
     frame_count = 0
@@ -363,21 +359,9 @@ def main():
         # Convertir BGR a RGB (OpenCV usa BGR, MediaPipe usa RGB)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Crear imagen de MediaPipe y procesar
+        # Crear imagen de MediaPipe y procesar (modo síncrono)
         mp_image = Image(image_format=ImageFormat.SRGB, data=frame_rgb)
-
-        # Variable para almacenar el resultado de este frame
-        resultado_actual = [None]
-
-        def callback(result: HandLandmarkerResult, image: Image, ts: int):
-            resultado_actual[0] = result
-
-        # Enviar a detect_async con callback local
-        landmarker.detect_async(mp_image, timestamp[0])
-        timestamp[0] += 1
-
-        # Pequeña pausa para permitir que el callback se ejecute
-        time.sleep(0.001)
+        result = landmarker.detect(mp_image)
 
         # Variables para este frame
         mano_detectada = False
@@ -387,8 +371,7 @@ def main():
         mov_y = ultimo_mov_y
 
         # Procesar resultado si existe
-        if resultado_actual[0] is not None:
-            result = resultado_actual[0]
+        if result is not None:
 
             if result.hand_landmarks and len(result.hand_landmarks) > 0:
                 hand_landmarks = result.hand_landmarks[0]  # Primera mano
