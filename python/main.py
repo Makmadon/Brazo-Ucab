@@ -113,6 +113,101 @@ def inicializar_arduino(puerto, baudios, timeout):
         return None, True
 
 # ============================================================================
+# FILTRO DE KALMAN 1D
+# ============================================================================
+
+class KalmanFilter1D:
+    """
+    Filtro de Kalman unidimensional para suavizar datos de control.
+    
+    Suaviza el jitter (temblor) de los landmarks detectados por MediaPipe,
+    prediciendo la posición basada en velocidad y corrigiendo con la medición.
+    
+    Args:
+        process_noise: Ruido del proceso (qué tanto confiar en la predicción)
+                      Mayor valor = más suave pero menos responsivo
+        measurement_noise: Ruido de medición (qué tanto confiar en la medición)
+                          Mayor valor = más suave pero más lento en responder
+        initial_value: Valor inicial del estado
+    """
+    
+    def __init__(self, process_noise=0.01, measurement_noise=0.1, initial_value=90.0):
+        # Estado: [posición, velocidad]
+        self.x = np.array([[initial_value], [0.0]])
+        
+        # Matriz de covarianza del error (incertidumbre inicial)
+        self.P = np.array([[1.0, 0.0], [0.0, 1.0]])
+        
+        # Matriz de transición de estado (modelo de velocidad constante)
+        # x_{k+1} = x_k + v_k * dt, asumimos dt=1 (entre frames)
+        self.F = np.array([[1.0, 1.0], [0.0, 1.0]])
+        
+        # Matriz de control (no usamos)
+        self.B = None
+        
+        # Matriz de observación (medimos solo posición)
+        self.H = np.array([[1.0, 0.0]])
+        
+        # Ruido del proceso (Q)
+        self.Q = np.array([
+            [process_noise, 0.0],
+            [0.0, process_noise * 0.5]
+        ])
+        
+        # Ruido de medición (R)
+        self.R = np.array([[measurement_noise]])
+        
+    def predict(self):
+        """
+        Etapa de predicción: estima el siguiente estado basado en el modelo.
+        """
+        # x = F * x
+        self.x = self.F @ self.x
+        # P = F * P * F^T + Q
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        
+    def update(self, measurement):
+        """
+        Etapa de actualización: corrige la predicción con la medición real.
+        
+        Args:
+            measurement: Valor medido (float)
+            
+        Returns:
+            float: Valor filtrado (posición estimada)
+        """
+        # Innovación: y = z - H * x (escalar)
+        y = measurement - (self.H @ self.x).item()
+        
+        # Covarianza de innovación: S = H * P * H^T + R
+        S = self.H @ self.P @ self.H.T + self.R
+        
+        # Ganancia de Kalman: K = P * H^T * S^{-1} (matriz 2x1)
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        
+        # Actualizar estado: x = x + K * y (K es 2x1, y es escalar -> multiplicación normal)
+        self.x = self.x + K * y
+        
+        # Actualizar covarianza: P = (I - K * H) * P
+        I = np.eye(2)
+        self.P = (I - K @ self.H) @ self.P
+        
+        # Retornar posición filtrada
+        return self.x[0, 0]
+
+    
+    def reset(self, value=None):
+        """
+        Reinicia el filtro a su estado inicial.
+        """
+        if value is not None:
+            self.x = np.array([[value], [0.0]])
+        else:
+            self.x = np.array([[90.0], [0.0]])
+        self.P = np.array([[1.0, 0.0], [0.0, 1.0]])
+
+
+# ============================================================================
 # FUNCIONES DE CÁLCULO DE PARÁMETROS
 # ============================================================================
 
@@ -217,7 +312,7 @@ def enviar_a_arduino(arduino, modo_simulacion, angulo, distancia, mov_x, mov_y):
 # ============================================================================
 
 def dibujar_info_en_frame(frame, angulo, distancia, mov_x, mov_y,
-                          mano_detectada, fps=None):
+                          mano_detectada, fps=None, enviando=True):
     """
     Dibuja la información de control y los valores calculados en el frame.
     """
@@ -236,7 +331,7 @@ def dibujar_info_en_frame(frame, angulo, distancia, mov_x, mov_y,
         ]
 
         # Rectángulo de fondo
-        cv2.rectangle(overlay, (5, 5), (250, 120), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (5, 5), (250, 145), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
         for i, text in enumerate(info_text):
@@ -244,6 +339,15 @@ def dibujar_info_en_frame(frame, angulo, distancia, mov_x, mov_y,
                 frame, text, (10, 30 + i * 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
             )
+
+        # Indicador de envío (PAUSADO o ENVIANDO)
+        status_color = (0, 255, 0) if enviando else (0, 0, 255)
+        status_text = "ENVIANDO" if enviando else "PAUSADO"
+        cv2.putText(
+            frame, f"[{status_text}]",
+            (10, 135), cv2.FONT_HERSHEY_SIMPLEX,
+            0.6, status_color, 2
+        )
     else:
         cv2.rectangle(overlay, (5, 5), (300, 40), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
@@ -263,7 +367,7 @@ def dibujar_info_en_frame(frame, angulo, distancia, mov_x, mov_y,
 
     # Instrucciones
     cv2.putText(
-        frame, "Presiona 'q' o 'ESC' para salir",
+        frame, "'ESPACIO': pausar/env | 'q'/'ESC': salir",
         (10, alto - 10), cv2.FONT_HERSHEY_SIMPLEX,
         0.5, (200, 200, 200), 1
     )
@@ -323,7 +427,15 @@ def main():
     print(f"\nConectando con Arduino en {PUERTO_SERIAL}...")
     arduino, modo_simulacion = inicializar_arduino(PUERTO_SERIAL, BAUD_RATE, TIMEOUT)
 
-    # --- PASO 5: Variables de control ---
+    # --- PASO 5: Inicializar Filtros de Kalman ---
+    # Cada parámetro de control tiene su propio filtro Kalman 1D
+    # Ajusta process_noise y measurement_noise para controlar suavizado vs respuesta
+    kf_angulo = KalmanFilter1D(process_noise=0.01, measurement_noise=0.15, initial_value=90.0)
+    kf_distancia = KalmanFilter1D(process_noise=0.02, measurement_noise=0.3, initial_value=90.0)
+    kf_mov_x = KalmanFilter1D(process_noise=0.02, measurement_noise=0.2, initial_value=90.0)
+    kf_mov_y = KalmanFilter1D(process_noise=0.02, measurement_noise=0.2, initial_value=90.0)
+
+    # --- PASO 6: Variables de control ---
     ultimo_angulo = 90.0
     ultima_distancia = 90.0
     ultimo_mov_x = 90.0
@@ -333,6 +445,9 @@ def main():
     frame_count = 0
     fps_start_time = time.time()
     fps_actual = 0.0
+
+    # Control de envío al Arduino (toggle con barra espaciadora)
+    enviando = True
 
     # --- PASO 6: BUCLE PRINCIPAL ---
     print("\n" + "=" * 60)
@@ -363,12 +478,18 @@ def main():
         mp_image = Image(image_format=ImageFormat.SRGB, data=frame_rgb)
         result = landmarker.detect(mp_image)
 
-        # Variables para este frame
+        # Variables para este frame (con filtro Kalman: predecir primero)
+        kf_angulo.predict()
+        kf_distancia.predict()
+        kf_mov_x.predict()
+        kf_mov_y.predict()
+
+        angulo_filtrado = kf_angulo.x[0, 0]
+        distancia_filtrada = kf_distancia.x[0, 0]
+        mov_x_filtrado = kf_mov_x.x[0, 0]
+        mov_y_filtrado = kf_mov_y.x[0, 0]
+
         mano_detectada = False
-        angulo = ultimo_angulo
-        distancia = ultima_distancia
-        mov_x = ultimo_mov_x
-        mov_y = ultimo_mov_y
 
         # Procesar resultado si existe
         if result is not None:
@@ -384,16 +505,22 @@ def main():
                     middle_tip = hand_landmarks[12]  # MIDDLE_FINGER_TIP
                     pinky_tip = hand_landmarks[20]   # PINKY_TIP
 
-                    # --- CALCULAR PARÁMETROS ---
-                    angulo = calcular_angulo_inclinacion(wrist, middle_tip)
-                    distancia = calcular_distancia_pulgar_menique(thumb_tip, pinky_tip)
-                    mov_x, mov_y = calcular_posicion_muneca(wrist)
+                    # --- CALCULAR PARÁMETROS (raw/medidos) ---
+                    angulo_raw = calcular_angulo_inclinacion(wrist, middle_tip)
+                    distancia_raw = calcular_distancia_pulgar_menique(thumb_tip, pinky_tip)
+                    mov_x_raw, mov_y_raw = calcular_posicion_muneca(wrist)
 
-                    # Actualizar últimos valores válidos
-                    ultimo_angulo = angulo
-                    ultima_distancia = distancia
-                    ultimo_mov_x = mov_x
-                    ultimo_mov_y = mov_y
+                    # --- APLICAR FILTRO DE KALMAN (actualizar con medición) ---
+                    angulo_filtrado = kf_angulo.update(angulo_raw)
+                    distancia_filtrada = kf_distancia.update(distancia_raw)
+                    mov_x_filtrado = kf_mov_x.update(mov_x_raw)
+                    mov_y_filtrado = kf_mov_y.update(mov_y_raw)
+
+                    # Actualizar últimos valores válidos (filtrados)
+                    ultimo_angulo = angulo_filtrado
+                    ultima_distancia = distancia_filtrada
+                    ultimo_mov_x = mov_x_filtrado
+                    ultimo_mov_y = mov_y_filtrado
 
                     mano_detectada = True
 
@@ -405,8 +532,11 @@ def main():
                         HandLandmarksConnections.HAND_CONNECTIONS
                     )
 
-        # --- ENVIAR DATOS AL ARDUINO ---
-        enviar_a_arduino(arduino, modo_simulacion, angulo, distancia, mov_x, mov_y)
+        # --- ENVIAR DATOS FILTRADOS AL ARDUINO (solo si no está en pausa) ---
+        if enviando:
+            enviar_a_arduino(arduino, modo_simulacion,
+                             angulo_filtrado, distancia_filtrada,
+                             mov_x_filtrado, mov_y_filtrado)
 
         # --- CALCULAR FPS ---
         frame_count += 1
@@ -417,16 +547,19 @@ def main():
             fps_start_time = time.time()
 
         # --- DIBUJAR INFORMACIÓN EN PANTALLA ---
-        dibujar_info_en_frame(frame, angulo, distancia, mov_x, mov_y,
-                              mano_detectada, fps_actual)
+        dibujar_info_en_frame(frame, angulo_filtrado, distancia_filtrada,
+                              mov_x_filtrado, mov_y_filtrado,
+                              mano_detectada, fps_actual, enviando)
 
         # --- MOSTRAR FRAME ---
         cv2.imshow('Control Gestual de Brazo Robotico', frame)
 
-        # --- SALIR CON 'q' O ESC ---
+        # --- TECLADO ---
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
             break
+        elif key == ord(' '):  # Barra espaciadora -> toggle envío
+            enviando = not enviando
 
     # ========================================================================
     # LIMPIEZA Y CIERRE
